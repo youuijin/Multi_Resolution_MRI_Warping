@@ -16,22 +16,23 @@ def apply_deformation_using_disp(img, displace_field):
     """
     img: torch.Tensor of shape (1, 1, D, H, W) - single channel 3D image
     displace_field: torch.Tensor of shape (1, D, H, W, 3) - displace field (dx, dy, dz)
+    x : W, y : H, z : D
     """
-    D, H, W = img.shape[2:]
+    B, _, D, H, W = img.shape
     
     # Generate normalized grid
     d = torch.linspace(-1, 1, D)
     h = torch.linspace(-1, 1, H)
     w = torch.linspace(-1, 1, W)
     grid_d, grid_h, grid_w = torch.meshgrid(d, h, w, indexing='ij')
-    grid = torch.stack((grid_w, grid_h, grid_d), dim=-1).unsqueeze(0).to(img.device)
+    grid = torch.stack((grid_w, grid_h, grid_d), dim=0)
+    grid = grid.unsqueeze(0).repeat(B, 1, 1, 1, 1).to(img.device)
 
     # Apply deformation
-    displace_field = displace_field.permute(0, 2, 3, 4, 1)  # Rearrange to (N, D, H, W, 3)
     deformed_grid = grid + displace_field
 
     # Reshape grid to match F.grid_sample requirements
-    deformed_grid = deformed_grid.view(img.shape[0], D, H, W, 3)
+    deformed_grid = deformed_grid.permute(0, 2, 3, 4, 1)
 
     # Perform deformation
     deformed_img = F.grid_sample(img, deformed_grid, mode='bilinear', padding_mode='border', align_corners=True)
@@ -85,6 +86,14 @@ def save_deformed_image(deformed_tensor, output_path, img_min, img_max, affine):
     deformed_nifti = nib.Nifti1Image(deformed_img, affine=affine)
     nib.save(deformed_nifti, output_path)
     
+def mm_norm(x):
+    B = x.shape[0]
+    out = []
+    for i in range(B):
+        xi = x[i]
+        out.append((xi - xi.min()) / (xi.max() - xi.min() + 1e-8))
+    return torch.stack(out)
+
 def resample_pytorch_5d(batch_tensor, current_spacing, target_spacing):
     """
     주어진 target spacing에 맞게 5D (B, C, D, H, W) 텐서를 resampling하는 함수.
@@ -155,36 +164,70 @@ def compose_displace(prev_displace, new_displace):
     composed_displace = prev_displace_upsampled + new_displace
     return composed_displace
 
-# def compose_deformation(prev_deformation, new_deformation):
-#     """
-#     이전 resolution의 deformation을 새로운 resolution에서 적용 (warping).
-#     :param prev_deformation: 이전 resolution의 deformation field (B, 3, D, H, W)
-#     :param new_deformation: 현재 resolution에서 학습한 deformation field (B, 3, D, H, W)
-#     :return: Composed deformation field (B, 3, D, H, W)
-#     """
-#     if prev_deformation is None:
-#         return new_deformation
+def add_identity_to_deformation(deformation_field):
+    D, H, W, _ = deformation_field.shape
+    identity = np.stack(np.meshgrid(
+        np.arange(D), np.arange(H), np.arange(W), indexing='ij'), axis=-1)
+    return deformation_field + identity
 
-#     B, C, D, H, W = new_deformation.shape
+# --- 2. Jacobian Determinant 계산 ---
+def compute_jacobian_determinant(displacement_field):
+    """
+    변형장의 Jacobian Determinant를 계산하여 반환
+    displacement_field: (X, Y, Z, 3) 형태의 변형장 (displacement field를 의미)
+    """
+    if displacement_field.shape[-1] !=3:
+        displacement_field = np.transpose(displacement_field, (1, 2, 3, 0)) # (X, Y, Z, 3)
 
-#     # 이전 deformation field를 현재 resolution으로 upsample
-#     prev_deformation_upsampled = upsample_deformation(prev_deformation, (D, H, W), prev_deformation.shape[2:])
-
-#     # **정규화된 Grid 생성 (-1 ~ 1 범위)**
-#     d_range = torch.linspace(-1, 1, D, device=new_deformation.device)
-#     h_range = torch.linspace(-1, 1, H, device=new_deformation.device)
-#     w_range = torch.linspace(-1, 1, W, device=new_deformation.device)
-#     d_grid, h_grid, w_grid = torch.meshgrid(d_range, h_range, w_range, indexing='ij')
+    H, W, D, _ = displacement_field.shape
     
-#     # Grid 형태 변환 (B, D, H, W, 3) 형태로 반복
-#     grid = torch.stack((w_grid, h_grid, d_grid), dim=-1).unsqueeze(0).repeat(B, 1, 1, 1, 1)
+    ## denormalize
+    def_voxel = displacement_field.copy()
+    def_voxel[..., 0] *= (W - 1) / 2
+    def_voxel[..., 1] *= (H - 1) / 2
+    def_voxel[..., 2] *= (D - 1) / 2
 
-#     # 이전 deformation field를 현재 resolution에 맞게 warping
-#     transformed_prev_deformation = F.grid_sample(prev_deformation_upsampled, grid, mode='bilinear', align_corners=True)
+    deformation_field = add_identity_to_deformation(def_voxel)
 
-#     # Composition 수행 (누적 변형)
-#     composed_deformation = transformed_prev_deformation + new_deformation
-#     return composed_deformation
+    dx = np.gradient(deformation_field[..., 0], axis=0)  # dφ_x/dx
+    dy = np.gradient(deformation_field[..., 0], axis=1)  # dφ_x/dy
+    dz = np.gradient(deformation_field[..., 0], axis=2)  # dφ_x/dz
+
+    ex = np.gradient(deformation_field[..., 1], axis=0)  # dφ_y/dx
+    ey = np.gradient(deformation_field[..., 1], axis=1)  # dφ_y/dy
+    ez = np.gradient(deformation_field[..., 1], axis=2)  # dφ_y/dz
+
+    fx = np.gradient(deformation_field[..., 2], axis=0)  # dφ_z/dx
+    fy = np.gradient(deformation_field[..., 2], axis=1)  # dφ_z/dy
+    fz = np.gradient(deformation_field[..., 2], axis=2)  # dφ_z/dz
+
+    # Jacobian 행렬 구성
+    jacobian = np.zeros(deformation_field.shape[:-1] + (3, 3))
+    jacobian[..., 0, 0] = dx
+    jacobian[..., 0, 1] = dy
+    jacobian[..., 0, 2] = dz
+
+    jacobian[..., 1, 0] = ex
+    jacobian[..., 1, 1] = ey
+    jacobian[..., 1, 2] = ez
+
+    jacobian[..., 2, 0] = fx
+    jacobian[..., 2, 1] = fy
+    jacobian[..., 2, 2] = fz
+
+    # # Determinant 계산
+    jacobian_det = np.linalg.det(jacobian)
+    return jacobian_det
+
+def calculate_negative_rate(displacement):
+    jacobian_det = compute_jacobian_determinant(displacement.detach().cpu().numpy().squeeze(0))
+    negative_mask = jacobian_det <= 0.
+    neg_num = negative_mask.sum().item()
+    tot_num = np.prod(jacobian_det.shape).item()
+    neg_rate = neg_num/tot_num
+
+    return neg_rate
+
 
 
 if __name__ in '__main__':

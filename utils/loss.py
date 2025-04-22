@@ -144,14 +144,14 @@ def jac_det_loss(displace_field):
     h_range = torch.arange(H, device=displace_field.device)
     w_range = torch.arange(W, device=displace_field.device)
     d_grid, h_grid, w_grid = torch.meshgrid(d_range, h_range, w_range, indexing='ij')
-    grid = torch.stack((w_grid, h_grid, d_grid), dim=0).float()  # (3, D, H, W)
+    grid = torch.stack((w_grid, h_grid, d_grid), dim=0).float()  # (D, H, W, 3)
     grid = grid.unsqueeze(0).repeat(B, 1, 1, 1, 1)
 
     deformation_field = grid + disp
 
-    dx = deformation_field[:, :, 1:, :-1, :-1] - deformation_field[:, :, :-1, :-1, :-1]
+    dz = deformation_field[:, :, 1:, :-1, :-1] - deformation_field[:, :, :-1, :-1, :-1]
     dy = deformation_field[:, :, :-1, 1:, :-1] - deformation_field[:, :, :-1, :-1, :-1]
-    dz = deformation_field[:, :, :-1, :-1, 1:] - deformation_field[:, :, :-1, :-1, :-1]
+    dx = deformation_field[:, :, :-1, :-1, 1:] - deformation_field[:, :, :-1, :-1, :-1]
 
     # (B, 3, D, H, W)
     J = torch.stack((dx, dy, dz), dim=-1)  # (B, 3, D, H, W, 3)
@@ -168,7 +168,7 @@ def jac_det_loss(displace_field):
     return jacobian_loss
 
 class TrainLoss(torch.nn.Module):
-    def __init__(self, sim='NCC', reg='tv', alpha="0.5", alp_sca=1.0):
+    def __init__(self, sim='NCC', reg=None, alpha=None, alp_sca=1.0, sca_fn='exp'):
         super(TrainLoss, self).__init__()
         self.alpha = alpha  # Adjust balance between NCC and NL2 normCC
         if sim == "MSE":
@@ -193,12 +193,127 @@ class TrainLoss(torch.nn.Module):
                 self.reg_loss += [loss_fn]
     
         self.alp_sca = alp_sca
+        self.sca_fn = sca_fn
 
-    def forward(self, deformed_img, template_img, displace_field, idx=0):
+    def forward(self, deformed_img, template_img, displace_field, idx=0, return_all=False):
+        sim_loss = self.sim_loss(deformed_img, template_img)
+        reg_loss = torch.tensor(0.0, device=deformed_img.device)
+        buff = [sim_loss]
+        for loss_fn, alpha in zip(self.reg_loss, self.reg_alpha):
+            # # exponential
+            if self.sca_fn == 'exp':
+                alpha = (self.alp_sca ** idx) * alpha
+            # linear
+            elif self.sca_fn == 'linear':
+                alpha = alpha*(self.alp_sca-1)/2*idx+alpha
+
+            reg_loss += alpha * loss_fn(displace_field)
+            buff += [alpha*loss_fn(displace_field)]
+
+        tot_loss = sim_loss + reg_loss
+        if return_all:
+            return buff
+        return tot_loss, sim_loss.item(), reg_loss.item()
+    
+
+class AdaptiveTrainLoss(torch.nn.Module):
+    def __init__(self, sim='NCC', reg='tv', alpha="0.5"):
+        super(AdaptiveTrainLoss, self).__init__()
+        if sim == "MSE":
+            self.sim_loss = MSE_loss
+        elif sim == "NCC":
+            self.sim_loss = NCC_loss
+        elif sim == "LNCC":
+            self.sim_loss = local_NCC_loss
+        
+        if reg is None:
+            self.reg_loss, self.reg_alpha = [], []
+        else:
+            assert len(reg.split("_")) == len(alpha.split("_"))
+            if reg == "tv":
+                loss_fn = tv_loss
+            elif reg == "l2":
+                loss_fn = l2_loss
+            elif reg == "jac":
+                loss_fn = jac_det_loss
+            self.reg_loss = loss_fn
+
+            self.alpha = [float(alpha), float(alpha), float(alpha)]
+
+    def compute_adaptive_lambda(self, phi_prev_upsampled, phi_current, base_lambda=0.5, gamma=10.0):
+        """
+        Parameters:
+        - phi_prev: [B, 3, D1, H1, W1] (coarse resolution displacement field)
+        - phi_current: [B, 3, D2, H2, W2] (current resolution displacement field)
+        - base_lambda: base scale for λ
+        - gamma: controls how sensitively λ changes with Δϕ
+        - min_lambda, max_lambda: clamps λ within this range
+
+        Returns:
+        - adaptive_lambda: scalar tensor [1] or batch-wise [B] if needed
+        """
+
+        # 1. Upsample previous displacement to current resolution
+        # phi_prev_upsampled = F.interpolate(phi_prev, size=phi_current.shape[2:], mode='trilinear', align_corners=True)
+
+        # 2. Compute average squared difference Δϕ (L2 distance)
+        delta_phi = (phi_current - phi_prev_upsampled).pow(2).mean(dim=[1,2,3,4])  # shape: [B]
+        print('delta', delta_phi)
+
+        # 3. Exponential decay function
+        #   large Δϕ → exp(-γ⋅Δϕ) → small λ
+        #   small Δϕ → exp(-γ⋅Δϕ) → near 1 → λ ~ base_lambda
+        adaptive_lambda = base_lambda * torch.exp(-gamma * delta_phi)  # shape: [B]
+
+        # 4. Clamp for numerical stability
+        # adaptive_lambda = torch.clamp(lambda_raw, min=min_lambda, max=max_lambda) #TODO: 필요하면 사용
+
+        return adaptive_lambda  # shape: [B]
+
+
+    def forward(self, deformed_img, template_img, displace_field, displace_prev, idx=0):
+        sim_loss = self.sim_loss(deformed_img, template_img)
+
+        if idx>0:
+            self.alpha[idx] = self.compute_adaptive_lambda(displace_prev, displace_field, base_lambda=self.alpha[0])
+        
+        reg_loss = self.reg_loss(displace_field)
+
+        print(idx, self.alpha[idx])
+
+        tot_loss = sim_loss + self.alpha[idx] * reg_loss
+        return tot_loss, sim_loss.item(), reg_loss.item()
+    
+
+class FusionNetLoss(torch.nn.Module):
+    def __init__(self, sim='MSE', reg='tv', alpha="0.5"):
+        super(FusionNetLoss, self).__init__()
+        self.alpha = alpha  # Adjust balance between NCC and NL2 normCC
+        if sim == "MSE":
+            self.sim_loss = MSE_loss
+        elif sim == "NCC":
+            self.sim_loss = NCC_loss
+        elif sim == "LNCC":
+            self.sim_loss = local_NCC_loss
+        
+        if reg is None:
+            self.reg_loss, self.reg_alpha = [], []
+        else:
+            assert len(reg.split("_")) == len(alpha.split("_"))
+            self.reg_loss, self.reg_alpha = [], [float(a) for a in alpha.split("_")]
+            for r in reg.split('_'):
+                if r == "tv":
+                    loss_fn = tv_loss
+                elif r == "l2":
+                    loss_fn = l2_loss
+                elif r == "jac":
+                    loss_fn = jac_det_loss
+                self.reg_loss += [loss_fn]
+
+    def forward(self, deformed_img, template_img, displace_field):
         sim_loss = self.sim_loss(deformed_img, template_img)
         reg_loss = torch.tensor(0.0, device=deformed_img.device)
         for loss_fn, alpha in zip(self.reg_loss, self.reg_alpha):
-            alpha = (self.alp_sca ** idx) * alpha
             reg_loss += alpha * loss_fn(displace_field)
 
         tot_loss = sim_loss + reg_loss
