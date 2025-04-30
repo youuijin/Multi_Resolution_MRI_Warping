@@ -28,11 +28,11 @@ def train_model(image_paths, template_path, out_ch, out_lay, loss='MSE', reg='TV
             method = 'Uncertainty_MrRegNet'
 
     if reg is None:
-        log_name = f'{method}_loss{loss}_lr{lr}_bs4'
+        log_name = f'{method}_loss{loss}_lr{lr}_bs{batch_size}'
     else:
-        log_name = f'{method}_loss{loss}({reg}_alpha{alpha})_lr{lr}_bs4'
+        log_name = f'{method}_loss{loss}({reg}_alpha{alpha})_lr{lr}_bs{batch_size}'
         if alp_sca != 1.0:
-            log_name = f'{method}_loss{loss}({reg}_alpha{alpha}_{sca_fn}_sca{alp_sca})_lr{lr}_bs4'
+            log_name = f'{method}_loss{loss}({reg}_alpha{alpha}_{sca_fn}_sca{alp_sca})_lr{lr}_bs{batch_size}'
     
     print('Training:', log_name)
     # os.makedirs(f'saved_images/{log_name}', exist_ok=True)
@@ -212,12 +212,14 @@ if __name__ == '__main__':
     parser.add_argument("--val_interval", type=int, default=5)
     parser.add_argument("--val_detail", default=False, action='store_true')
 
+    parser.add_argument("--batch_size", type=int, default=1)
+
     args = parser.parse_args()
 
     # Example usage
     set_seed(seed=0)
     train_model(args.image_path, args.template_path, loss=args.loss, reg=args.reg, out_ch=6, out_lay=args.out_layers, \
-                alpha=args.alpha, alp_sca=args.alp_sca, sca_fn=args.sca_fn, epochs=200, lr=1e-4, batch_size=1, \
+                alpha=args.alpha, alp_sca=args.alp_sca, sca_fn=args.sca_fn, epochs=200, lr=1e-4, batch_size=args.batch_size, \
                 val_interval=args.val_interval, val_detail=args.val_detail, saved_path=args.saved_path, start_epoch=args.start_epoch)
     
     wandb.finish()
