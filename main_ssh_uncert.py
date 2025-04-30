@@ -4,8 +4,7 @@ import torch.optim as optim
 import numpy as np
 from tqdm import tqdm
 import os, wandb
-from utils.R2Net_model import U_Net_Hyprid, Correction
-# from utils.mr_d_model_Large import MrRegDispNetLarge
+from utils.R2Net_model import U_Net_Hyprid
 
 import argparse
 
@@ -13,30 +12,27 @@ from utils.utils import *
 from utils.loss import UncertaintyLoss
 from utils.dataset import set_dataloader
 
-from evaluation.evaluate_dice_FS_MrRegNet import test
-
 wandb.login(key="87539aeaa75ad2d8a28ec87d70e5d6ce1277c544")
 
 # Training setup
 def train_model(image_paths, template_path, out_ch, out_lay, loss='MSE', reg='TV', epochs=200, batch_size=1, lr=1e-4, alpha=0.5, alp_sca=1.0, sca_fn='exp', val_interval=5, val_detail=False, start_epoch=0, saved_path=None):
-    
     if out_ch==3:
         if out_lay==1:
             method = 'VM'
         else:
-            method = 'Uncertainty_VM'
+            method = 'MrRegNet'
     else:
         if out_lay==1:
-            method = 'MrRegNet'
+            method = 'Uncertainty_VM'
         else:
             method = 'Uncertainty_MrRegNet'
 
     if reg is None:
-        log_name = f'{method}_loss{loss}_lr{lr}'
+        log_name = f'{method}_loss{loss}_lr{lr}_bs4'
     else:
-        log_name = f'{method}_loss{loss}({reg}_alpha{alpha})_lr{lr}'
+        log_name = f'{method}_loss{loss}({reg}_alpha{alpha})_lr{lr}_bs4'
         if alp_sca != 1.0:
-            log_name = f'{method}_loss{loss}({reg}_alpha{alpha}_{sca_fn}_sca{alp_sca})_lr{lr}'
+            log_name = f'{method}_loss{loss}({reg}_alpha{alpha}_{sca_fn}_sca{alp_sca})_lr{lr}_bs4'
     
     print('Training:', log_name)
     # os.makedirs(f'saved_images/{log_name}', exist_ok=True)
@@ -48,6 +44,8 @@ def train_model(image_paths, template_path, out_ch, out_lay, loss='MSE', reg='TV
         config={
             "epochs": epochs,
             "batch_size": batch_size,
+            "out_channels":out_ch, 
+            "out_layers":out_lay,
             "learning_rate": lr,
             "reg": reg,
             "alpha": alpha,
@@ -56,7 +54,7 @@ def train_model(image_paths, template_path, out_ch, out_lay, loss='MSE', reg='TV
         }
     )
 
-    train_loader, val_loader, save_loader = set_dataloader(image_paths, template_path, batch_size)
+    train_loader, val_loader, _ = set_dataloader(image_paths, template_path, batch_size)
 
     model = U_Net_Hyprid(out_channels=out_ch, out_layers=out_lay)
     
@@ -76,8 +74,9 @@ def train_model(image_paths, template_path, out_ch, out_lay, loss='MSE', reg='TV
         total_loss = 0
         similar_loss = 0
         reg_std_loss = 0
-        smooth_loss = 0
-        uncertainties = 0
+        smooth_loss_tot = 0
+        smooth_loss = [[0. for _ in range(out_lay)] for _ in range(len(reg.split("_")))]
+        uncertainties = [0. for _ in range(out_lay)]
         for (img, template, _, _, _) in tqdm(train_loader, desc=f"Epoch {epoch}"):
             img, template = img.unsqueeze(1).cuda(), template.unsqueeze(1).cuda()
             stacked_input = torch.cat([img, template], dim=1)
@@ -85,41 +84,57 @@ def train_model(image_paths, template_path, out_ch, out_lay, loss='MSE', reg='TV
             # get deformation field
             tot_mean, tot_std, means, stds = model(stacked_input) # return lists
 
-            mean, std = tot_mean[-1], tot_std[-1]
-            deformed_cur_img = apply_deformation_using_disp(img, mean)
+            deformed_cur_img = apply_deformation_using_disp(img, tot_mean[-1])
 
-            loss, diff_loss, std_loss, smoo_loss = criterion(deformed_cur_img, template, tot_mean, tot_std, means, stds, 0)
+            loss, diff_loss, std_loss, sm_loss, buff = criterion(deformed_cur_img, template, tot_mean, tot_std, means, stds, 0, return_all=True)
             
-            total_loss += loss.item()
-            similar_loss += diff_loss
-            reg_std_loss += std_loss
-            smooth_loss += smoo_loss
-            uncertainties += std.mean()
-
             # calculate loss and train model
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+
+            total_loss += loss.item()
+            similar_loss += diff_loss
+            reg_std_loss += std_loss
+            smooth_loss_tot += sm_loss
+            for i in range(out_lay):
+                uncertainties[i] += stds[i].mean()
+            
+            for i in range(len(smooth_loss)):
+                for j in range(out_lay):
+                    smooth_loss[i][j] += buff[i*out_lay + j]
+
 
         print(f"Epoch {epoch}/{epochs}, Train Loss: {total_loss / len(train_loader)}")
 
         # === wandb Logging (Train) ===
         wandb.log({
             "Train/Total_Loss": total_loss / len(train_loader),
-            "Train/Similarity_Loss": similar_loss/len(train_loader),
-            "Train/Regularizer_Loss_ETC": smooth_loss/len(train_loader),
-            "Train/Regularizer_Loss": reg_std_loss/len(train_loader),
-            "Train/Uncertainty": uncertainties/len(train_loader),
+            "Train/NLL_sim": similar_loss/len(train_loader),
+            "Train/Smooth": smooth_loss_tot/len(train_loader),
+            "Train/NLL_std": reg_std_loss/len(train_loader),
             "Epoch": epoch
         })
+        for i in range(out_lay):
+            wandb.log({
+                f"Train_Uncert/layer_{out_lay-i}": uncertainties[i] / len(train_loader),
+                "Epoch": epoch
+            })
+        for i, r in enumerate(reg.split("_")):
+            for j in range(out_lay):
+                wandb.log({
+                    f"Train_{r}/layer_{out_lay-j}": smooth_loss[i][j] / len(train_loader),
+                    "Epoch": epoch
+                })
+
 
         if epoch%val_interval == 0:
             model.eval()
             total_loss = 0
             similar_loss = 0
-            smooth_loss = 0
-            neg_rates = 0
-            uncertainties = 0
+            smooth_loss_tot = 0
+            smooth_loss = [[0. for _ in range(out_lay)] for _ in range(len(reg.split("_")))]
+            uncertainties = [0. for _ in range(out_lay)]
             with torch.no_grad():
                 for (img, template, _, _, _) in val_loader:
                     img, template = img.unsqueeze(1).cuda(), template.unsqueeze(1).cuda()
@@ -127,41 +142,42 @@ def train_model(image_paths, template_path, out_ch, out_lay, loss='MSE', reg='TV
 
                     # get deformation field
                     tot_mean, tot_std, means, stds = model(stacked_input)
-            
-                    mean, std = tot_mean[-1], tot_std[-1]
 
-                    deformed_cur_img = apply_deformation_using_disp(img, mean)
+                    deformed_cur_img = apply_deformation_using_disp(img, tot_mean[-1])
 
-                    loss, diff_loss, std_loss, smoo_loss = criterion(deformed_cur_img, template, mean, std, None, None, 0)
+                    loss, diff_loss, std_loss, sm_loss, buff = criterion(deformed_cur_img, template, tot_mean, tot_std, means, stds, 0, return_all=True)
             
                     total_loss += loss.item()
                     similar_loss += diff_loss
                     reg_std_loss += std_loss
-                    smooth_loss += smoo_loss
-                    uncertainties += std.mean()
-                        
-                    if val_detail:
-                        # logging Jacobian determinant
-                        neg_rate = calculate_negative_rate(mean)
-                        neg_rates += neg_rate
+                    smooth_loss_tot += sm_loss
 
-                if val_detail:
-                    avg_dice, _ = test(model, uncertain=True)
-                    wandb.log({
-                        "Val/avg_dice": avg_dice,
-                        "Val/neg_rate": neg_rates/len(val_loader),
-                        "Epoch": epoch
-                    })
+                    for i in range(out_lay):
+                        uncertainties[i] += stds[i].mean()
+                    
+                    for i in range(len(smooth_loss)):
+                        for j in range(out_lay):
+                            smooth_loss[i][j] += buff[i*out_lay + j]
 
                 # === wandb Logging (Validation) ===
                 wandb.log({
                     "Val/Total_Loss": total_loss / len(val_loader),
-                    "Val/Similarity_Loss": similar_loss/len(val_loader),
-                    "Val/Regularizer_Loss_ETC": smooth_loss/len(val_loader),
-                    "Val/Regularizer_Loss": reg_std_loss/len(val_loader),
-                    "Val/Uncertainty": uncertainties/len(val_loader),
+                    "Val/NLL_sim": similar_loss/len(val_loader),
+                    "Val/NLL_std": reg_std_loss/len(val_loader),
+                    "Val/Smooth": smooth_loss_tot/len(val_loader),
                     "Epoch": epoch
                 })
+                for i in range(out_lay):
+                    wandb.log({
+                        f"Val_Uncert/layer_{out_lay-i}": uncertainties[i] / len(val_loader),
+                        "Epoch": epoch
+                    })
+                for i, r in enumerate(reg.split("_")):
+                    for j in range(out_lay):
+                        wandb.log({
+                            f"Val_{r}/layer_{out_lay-j}": smooth_loss[i][j] / len(val_loader),
+                            "Epoch": epoch
+                        })
 
                 print(f"Epoch {epoch}/{epochs}, Valid Loss: {total_loss / len(val_loader)}")
                 if best_loss > total_loss / len(val_loader):
@@ -200,7 +216,7 @@ if __name__ == '__main__':
 
     # Example usage
     set_seed(seed=0)
-    train_model(args.image_path, args.template_path, loss=args.loss, reg=args.reg, out_ch=args.out_channels, out_lay=args.out_layers, \
+    train_model(args.image_path, args.template_path, loss=args.loss, reg=args.reg, out_ch=6, out_lay=args.out_layers, \
                 alpha=args.alpha, alp_sca=args.alp_sca, sca_fn=args.sca_fn, epochs=200, lr=1e-4, batch_size=1, \
                 val_interval=args.val_interval, val_detail=args.val_detail, saved_path=args.saved_path, start_epoch=args.start_epoch)
     

@@ -3,7 +3,7 @@ import torch.nn.functional as F
 
 # Loss functions
 ## similarity - NCC
-def NCC_loss(x, y, eps=1e-8):
+def NCC_loss(x, y, eps=1e-8, std=None):
     """
     Calculate the normalized cross correlation (NCC) between two tensors.
     Args:
@@ -110,7 +110,7 @@ def l2_loss(displace_field):
     return torch.mean(displace_field ** 2)
 
 ## regularization - Total Variation
-def tv_loss(displace):
+def tv_loss(displace, std=None):
     """
     displace: Tensor of shape [B, 3, D, H, W]
     TV loss는 인접 voxel 간의 L1 차이의 평균을 구하는 방식입니다.
@@ -207,114 +207,105 @@ class TrainLoss(torch.nn.Module):
             elif self.sca_fn == 'linear':
                 alpha = alpha*(self.alp_sca-1)/2*idx+alpha
 
-            reg_loss += alpha * loss_fn(displace_field)
-            buff += [alpha*loss_fn(displace_field)]
+            this_loss = loss_fn(displace_field)
+
+            reg_loss += alpha * this_loss
+            buff += [this_loss]
 
         tot_loss = sim_loss + reg_loss
         if return_all:
             return buff
         return tot_loss, sim_loss.item(), reg_loss.item()
+
+def negative_log_likelihood(moved, fixed, std): # 사실 두 loss를 더한 형태가 맞지만, logging을 위해 분리하여 사용
+    # nll = ((fixed - moved) ** 2) / (2 * std ** 2 + 1e-5) + 0.5 * torch.log(std ** 2 + 1e-5)
+    nll = ((fixed - moved) ** 2) / (2 * std ** 2 + 1e-5)
+    return nll.mean()
+
+def nll_reg(std):
+    return (0.5 * torch.log(std ** 2 + 1e-5)).mean()
+
+def KL_div_loss(mean, std):
+    kl = 0.5 * (mean**2 + std**2 - torch.log(std**2 + 1e-6) -1)
+    return kl.mean()
+
+## regularization - Total Variation
+def adaptive_tv_loss(phi, std, eps=1e-6):
+    """
+    displace: Tensor of shape [B, 3, D, H, W]
+    TV loss는 인접 voxel 간의 L1 차이의 평균을 구하는 방식입니다.
+    """
+    # Depth 방향 차이 (D axis)
+    dz = torch.abs(phi[:, :, 1:, :, :] - phi[:, :, :-1, :, :])
+    # Height 방향 차이 (H axis)
+    dy = torch.abs(phi[:, :, :, 1:, :] - phi[:, :, :, :-1, :])
+    # Width 방향 차이 (W axis)
+    dx = torch.abs(phi[:, :, :, :, 1:] - phi[:, :, :, :, :-1])
     
+    sigma_z = std[:, :, 1:, :, :]
+    sigma_y = std[:, :, :, 1:, :]
+    sigma_x = std[:, :, :, :, 1:]
 
-class AdaptiveTrainLoss(torch.nn.Module):
-    def __init__(self, sim='NCC', reg='tv', alpha="0.5"):
-        super(AdaptiveTrainLoss, self).__init__()
-        if sim == "MSE":
-            self.sim_loss = MSE_loss
-        elif sim == "NCC":
-            self.sim_loss = NCC_loss
-        elif sim == "LNCC":
-            self.sim_loss = local_NCC_loss
-        
-        if reg is None:
-            self.reg_loss, self.reg_alpha = [], []
-        else:
-            assert len(reg.split("_")) == len(alpha.split("_"))
-            if reg == "tv":
-                loss_fn = tv_loss
-            elif reg == "l2":
-                loss_fn = l2_loss
-            elif reg == "jac":
-                loss_fn = jac_det_loss
-            self.reg_loss = loss_fn
-
-            self.alpha = [float(alpha), float(alpha), float(alpha)]
-
-    def compute_adaptive_lambda(self, phi_prev_upsampled, phi_current, base_lambda=0.5, gamma=10.0):
-        """
-        Parameters:
-        - phi_prev: [B, 3, D1, H1, W1] (coarse resolution displacement field)
-        - phi_current: [B, 3, D2, H2, W2] (current resolution displacement field)
-        - base_lambda: base scale for λ
-        - gamma: controls how sensitively λ changes with Δϕ
-        - min_lambda, max_lambda: clamps λ within this range
-
-        Returns:
-        - adaptive_lambda: scalar tensor [1] or batch-wise [B] if needed
-        """
-
-        # 1. Upsample previous displacement to current resolution
-        # phi_prev_upsampled = F.interpolate(phi_prev, size=phi_current.shape[2:], mode='trilinear', align_corners=True)
-
-        # 2. Compute average squared difference Δϕ (L2 distance)
-        delta_phi = (phi_current - phi_prev_upsampled).pow(2).mean(dim=[1,2,3,4])  # shape: [B]
-        print('delta', delta_phi)
-
-        # 3. Exponential decay function
-        #   large Δϕ → exp(-γ⋅Δϕ) → small λ
-        #   small Δϕ → exp(-γ⋅Δϕ) → near 1 → λ ~ base_lambda
-        adaptive_lambda = base_lambda * torch.exp(-gamma * delta_phi)  # shape: [B]
-
-        # 4. Clamp for numerical stability
-        # adaptive_lambda = torch.clamp(lambda_raw, min=min_lambda, max=max_lambda) #TODO: 필요하면 사용
-
-        return adaptive_lambda  # shape: [B]
-
-
-    def forward(self, deformed_img, template_img, displace_field, displace_prev, idx=0):
-        sim_loss = self.sim_loss(deformed_img, template_img)
-
-        if idx>0:
-            self.alpha[idx] = self.compute_adaptive_lambda(displace_prev, displace_field, base_lambda=self.alpha[0])
-        
-        reg_loss = self.reg_loss(displace_field)
-
-        print(idx, self.alpha[idx])
-
-        tot_loss = sim_loss + self.alpha[idx] * reg_loss
-        return tot_loss, sim_loss.item(), reg_loss.item()
+    weight_z = 1.0 / (sigma_z**2 + eps)
+    weight_y = 1.0 / (sigma_y**2 + eps)
+    weight_x = 1.0 / (sigma_x**2 + eps)
     
+    loss_z = (weight_z * dz.abs()).mean()
+    loss_y = (weight_y * dy.abs()).mean()
+    loss_x = (weight_x * dx.abs()).mean()
+    
+    loss = (loss_z + loss_y + loss_x)/3
+    return loss
 
-class FusionNetLoss(torch.nn.Module):
-    def __init__(self, sim='MSE', reg='tv', alpha="0.5"):
-        super(FusionNetLoss, self).__init__()
+class UncertaintyLoss(torch.nn.Module):
+    def __init__(self, sim='NLL', reg=None, alpha=None, alp_sca=1.0, sca_fn='exp'):
+        super(UncertaintyLoss, self).__init__()
         self.alpha = alpha  # Adjust balance between NCC and NL2 normCC
-        if sim == "MSE":
-            self.sim_loss = MSE_loss
+        self.sim = sim
+        if sim == "NLL":
+            self.sim_loss = negative_log_likelihood
         elif sim == "NCC":
             self.sim_loss = NCC_loss
-        elif sim == "LNCC":
-            self.sim_loss = local_NCC_loss
         
         if reg is None:
-            self.reg_loss, self.reg_alpha = [], []
+            self.reg_loss, self.reg_alpha = [], [] # default regularizer
         else:
             assert len(reg.split("_")) == len(alpha.split("_"))
             self.reg_loss, self.reg_alpha = [], [float(a) for a in alpha.split("_")]
             for r in reg.split('_'):
-                if r == "tv":
+                if r == 'KL':
+                    loss_fn = KL_div_loss
+                elif r == "atv":
+                    loss_fn = adaptive_tv_loss
+                elif r == "tv":
                     loss_fn = tv_loss
-                elif r == "l2":
-                    loss_fn = l2_loss
-                elif r == "jac":
-                    loss_fn = jac_det_loss
                 self.reg_loss += [loss_fn]
+    
+        self.alp_sca = alp_sca
+        self.sca_fn = sca_fn
 
-    def forward(self, deformed_img, template_img, displace_field):
-        sim_loss = self.sim_loss(deformed_img, template_img)
+    def forward(self, deformed_img, template_img, disp_mean, disp_std, res_mean, res_std, idx=0, return_all=False):
+        out_layers = len(disp_mean)
+        weights = [1/2**(out_layers - i-1) for i in range(out_layers)] # 1/4, 1/2, 1
+        
+        if self.sim == 'NLL':
+            sim_loss = self.sim_loss(deformed_img, template_img, disp_std[-1]) # only in last layer
+            reg_std_loss = nll_reg(disp_std[-1]) # only in last layer
+        elif self.sim == "NCC":
+            sim_loss = self.sim_loss(deformed_img, template_img)
+            reg_std_loss = torch.tensor(0.0, device=deformed_img.device)
+
+        buff = []
         reg_loss = torch.tensor(0.0, device=deformed_img.device)
         for loss_fn, alpha in zip(self.reg_loss, self.reg_alpha):
-            reg_loss += alpha * loss_fn(displace_field)
+            # every resolution using weight
+            for w, mean, std in zip(weights, res_mean, res_std):
+                this_loss = loss_fn(mean, std)
+                reg_loss += w * alpha *this_loss
+                if return_all:
+                    buff.append(this_loss.item())
 
-        tot_loss = sim_loss + reg_loss
-        return tot_loss, sim_loss.item(), reg_loss.item()
+        tot_loss = sim_loss + reg_std_loss + reg_loss
+        if return_all:
+            return tot_loss, sim_loss.item(), reg_std_loss.item(), reg_loss.item(), buff
+        return tot_loss, sim_loss.item(), reg_std_loss.item(), reg_loss.item()
