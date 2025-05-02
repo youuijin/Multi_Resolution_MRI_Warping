@@ -1,6 +1,8 @@
 import torch
 import torch.nn.functional as F
 
+from utils.utils import normalize_deformation
+
 # Loss functions
 ## similarity - NCC
 def NCC_loss(x, y, eps=1e-8, std=None):
@@ -115,6 +117,7 @@ def tv_loss(displace, std=None):
     displace: Tensor of shape [B, 3, D, H, W]
     TV loss는 인접 voxel 간의 L1 차이의 평균을 구하는 방식입니다.
     """
+    displace = normalize_deformation(displace)
     # Depth 방향 차이 (D axis)
     dz = torch.abs(displace[:, :, 1:, :, :] - displace[:, :, :-1, :, :])
     # Height 방향 차이 (H axis)
