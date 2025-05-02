@@ -53,21 +53,22 @@ def apply_displace_segment(seg, displace_field):
     seg: torch.Tensor of shape (1, 1, D, H, W) - single channel 3D image
     displace_field: torch.Tensor of shape (1, D, H, W, 3) - displace field (dx, dy, dz)
     """
-    D, H, W = seg.shape[2:]
+    B, _, D, H, W = seg.shape
     
     # Generate normalized grid
     d = torch.linspace(-1, 1, D)
     h = torch.linspace(-1, 1, H)
     w = torch.linspace(-1, 1, W)
     grid_d, grid_h, grid_w = torch.meshgrid(d, h, w, indexing='ij')
-    grid = torch.stack((grid_w, grid_h, grid_d), axis=-1).unsqueeze(0).to(seg.device)
+    grid = torch.stack((grid_w, grid_h, grid_d), dim=0)
+    grid = grid.unsqueeze(0).repeat(B, 1, 1, 1, 1).to(seg.device)
 
     # Apply deformation
-    displace_field = displace_field.permute(0, 2, 3, 4, 1)  # Rearrange to (N, D, H, W, 3)
-    deformed_grid = grid + displace_field
+    normalized_disp = normalize_deformation(displace_field)
+    deformed_grid = grid + normalized_disp
 
     # Reshape grid to match F.grid_sample requirements
-    deformed_grid = deformed_grid.view(seg.shape[0], D, H, W, 3)
+    deformed_grid = deformed_grid.permute(0, 2, 3, 4, 1)
 
     # Perform deformation
     deformed_seg = F.grid_sample(seg, deformed_grid, mode='nearest', padding_mode='border', align_corners=True)

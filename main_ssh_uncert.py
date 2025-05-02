@@ -20,8 +20,7 @@ def save_middle_slices(img_3d, epoch, idx):
     img_3d: [D, H, W] or [1, D, H, W] or [B, 1, D, H, W] (e.g., torch.Tensor)
     Returns: matplotlib Figure with x, y, z middle slices side-by-side
     """
-    if isinstance(img_3d, torch.Tensor):
-        img_3d = img_3d.squeeze().detach().cpu().numpy()
+    img_3d = img_3d.squeeze().detach().cpu().numpy()
 
     D, H, W = img_3d.shape
 
@@ -146,7 +145,8 @@ def train_model(image_paths, template_path, out_ch, out_lay, image_sigma, prior_
         wandb.log({
             "Train/Total_Loss": total_loss / len(train_loader),
             "Train/Similar_Loss": total_similar / len(train_loader),
-            "Train/Smooth_Loss": total_smooth / len(train_loader)
+            "Train/Smooth_Loss": total_smooth / len(train_loader),
+            "Epoch": epoch
         }, step=epoch)
         for i in range(out_lay):
             wandb.log({

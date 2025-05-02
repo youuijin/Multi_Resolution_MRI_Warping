@@ -21,8 +21,7 @@ def save_middle_slices(img_3d, epoch, idx):
     img_3d: [D, H, W] or [1, D, H, W] or [B, 1, D, H, W] (e.g., torch.Tensor)
     Returns: matplotlib Figure with x, y, z middle slices side-by-side
     """
-    if isinstance(img_3d, torch.Tensor):
-        img_3d = img_3d.squeeze().detach().cpu().numpy()
+    img_3d = img_3d.squeeze().detach().cpu().numpy()
 
     D, H, W = img_3d.shape
 
@@ -138,16 +137,15 @@ def train_model(image_paths, template_path, out_ch, out_lay, loss='MSE', reg='TV
             "Train/Total_Loss": total_loss.mean() / len(train_loader),
             "Train/Similarity_Loss": similar_loss.mean()/len(train_loader),
             "Train/Regularizer_Loss": smooth_loss.mean()/len(train_loader),
-            "Epoch": epoch
-        })
+            "Epoch":epoch
+        }, step=epoch)
         if out_lay>1:
             for idx, resolution in enumerate([3, 2, 1]):
                 wandb.log({
                     f"Train/Total_Loss_layer_{resolution}": total_loss[idx]/len(train_loader),
                     f"Train/Similarity_Loss_layer_{resolution}": similar_loss[idx]/len(train_loader),
-                    f"Train/Regularizer_Loss_layer_{resolution}": smooth_loss[idx]/len(train_loader),
-                    "Epoch": epoch
-                })
+                    f"Train/Regularizer_Loss_layer_{resolution}": smooth_loss[idx]/len(train_loader)
+                }, step=epoch)
 
         if epoch%val_interval == 0:
             model.eval()
@@ -177,23 +175,21 @@ def train_model(image_paths, template_path, out_ch, out_lay, loss='MSE', reg='TV
                         smooth_loss[idx] += smoo_loss
 
                     if idx < 2:
-                        save_middle_slices(deformed_cur_img, epoch, idx)
+                        save_middle_slices(deformed_cur_img[0], epoch, idx)
 
                 # === wandb Logging (Validation) ===
                 wandb.log({
                     "Val/Total_Loss": total_loss.mean() / len(val_loader),
                     "Val/Similarity_Loss": similar_loss.mean()/len(val_loader),
-                    "Val/Regularizer_Loss": smooth_loss.mean()/len(val_loader),
-                    "Epoch": epoch
-                })
+                    "Val/Regularizer_Loss": smooth_loss.mean()/len(val_loader)
+                }, step=epoch)
                 if out_lay>1:
                     for idx, resolution in enumerate([3, 2, 1]):
                         wandb.log({
                             f"Val/Total_Loss_layer_{resolution}": total_loss[idx]/len(val_loader),
                             f"Val/Similarity_Loss_layer_{resolution}": similar_loss[idx]/len(val_loader),
-                            f"Val/Regularizer_Loss_layer_{resolution}": smooth_loss[idx]/len(val_loader),
-                            "Epoch": epoch
-                        })
+                            f"Val/Regularizer_Loss_layer_{resolution}": smooth_loss[idx]/len(val_loader)
+                        }, step=epoch)
                 
                 print(f"Epoch {epoch}/{epochs}, Valid Loss: {total_loss.mean() / len(val_loader)}")
                 if best_loss > total_loss.mean() / len(val_loader):
