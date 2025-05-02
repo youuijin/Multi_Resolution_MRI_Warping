@@ -90,8 +90,6 @@ def train_model(image_paths, template_path, out_ch, out_lay, image_sigma, prior_
             for i in range(out_lay):
                 uncertainties[i] += stds[i].mean()
 
-            break
-
         print(f"Epoch {epoch}/{epochs}, Train Loss: {total_loss / len(train_loader)}")
 
         # === wandb Logging (Train) ===
@@ -134,8 +132,6 @@ def train_model(image_paths, template_path, out_ch, out_lay, image_sigma, prior_
                     for i in range(out_lay):
                         uncertainties[i] += stds[i].mean()
 
-                    break
-                    
                 # === wandb Logging (Validation) ===
                 wandb.log({
                     "Val/Total_Loss": total_loss / len(val_loader),
@@ -164,8 +160,6 @@ def train_model(image_paths, template_path, out_ch, out_lay, image_sigma, prior_
                     wandb.save( f'./{log_name}_mse.pt')
                 else: 
                     cnt+=1
-
-        return
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
