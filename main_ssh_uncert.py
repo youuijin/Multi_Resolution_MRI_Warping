@@ -51,8 +51,7 @@ def train_model(image_paths, template_path, out_ch, out_lay, image_sigma, prior_
         model.load_state_dict(torch.load(saved_path, weights_only=True))
     model = model.cuda()
     optimizer = optim.Adam(model.parameters(), lr=lr)
-    # criterion = RegistrationLoss(reg, lambda_kl, lambda_smooth)
-    criterion = Miccai2018Loss(reg=reg, vol_shape=(192, 224, 192))
+    criterion = Miccai2018Loss(reg=reg, image_sigma=image_sigma, prior_lambda=prior_lambda)
 
     best_loss = 100000
     best_mse_loss= 100000
@@ -64,20 +63,32 @@ def train_model(image_paths, template_path, out_ch, out_lay, image_sigma, prior_
         model.train()
         total_loss = 0
         total_similar, total_smooth = 0, 0
-        uncertainties = [0. for _ in range(out_lay)]
+        uncertainties, smooths = [0. for _ in range(out_lay)], [0. for _ in range(out_lay)]
         for (img, template, _, _, _) in tqdm(train_loader, desc=f"Epoch {epoch}"):
             img, template = img.unsqueeze(1).cuda(), template.unsqueeze(1).cuda()
             stacked_input = torch.cat([img, template], dim=1)
 
             # get deformation field
             tot_mean, tot_std, means, stds = model(stacked_input) # return lists
-
-            eps = torch.randn_like(tot_mean[-1])
-            sampling_disp = tot_mean[-1] + eps * tot_std[-1] # reference : VoxelMorph-diff, sampling in training phase
+            
+            # sampling in multi-resolution
+            sampling_disp = None
+            for m, s in zip(means, stds):
+                eps_r = torch.randn_like(m)
+                disp_r = m + eps_r * s
+                if sampling_disp == None:
+                    sampling_disp = disp_r
+                else:
+                    # upsample previous to match current level
+                    upsampled = F.interpolate(sampling_disp, size=disp_r.shape[2:], mode='trilinear', align_corners=True)
+                    sampling_disp = disp_r + upsampled
+            
+            # eps = torch.randn_like(tot_mean[-1])
+            # sampling_disp = tot_mean[-1] + eps * tot_std[-1] # reference : VoxelMorph-diff, sampling in training phase
 
             deformed_cur_img = apply_deformation_using_disp(img, sampling_disp)
 
-            loss, similar, smooth = criterion(deformed_cur_img, template, tot_mean[-1], tot_std[-1]) #TODO : expand multi-resolution 
+            loss, similar, smooth, buff = criterion(deformed_cur_img, template, means, stds, return_all=True) #TODO : expand multi-resolution 
     
             # calculate loss and train model
             optimizer.zero_grad()
@@ -89,6 +100,7 @@ def train_model(image_paths, template_path, out_ch, out_lay, image_sigma, prior_
             total_smooth += smooth
             for i in range(out_lay):
                 uncertainties[i] += stds[i].mean()
+                smooths[i] += buff[i]
 
         print(f"Epoch {epoch}/{epochs}, Train Loss: {total_loss / len(train_loader)}")
 
@@ -102,6 +114,7 @@ def train_model(image_paths, template_path, out_ch, out_lay, image_sigma, prior_
         for i in range(out_lay):
             wandb.log({
                 f"Train_Uncert/layer_{out_lay-i}": uncertainties[i] / len(train_loader),
+                f"Train_Smooth/layer_{out_lay-i}": smooths[i] / len(train_loader),
                 "Epoch": epoch
             })
 
@@ -110,7 +123,7 @@ def train_model(image_paths, template_path, out_ch, out_lay, image_sigma, prior_
             total_loss = 0
             total_MSE_loss = 0
             total_similar, total_smooth = 0, 0
-            uncertainties = [0. for _ in range(out_lay)]
+            uncertainties, smooths = [0. for _ in range(out_lay)], [0. for _ in range(out_lay)]
             with torch.no_grad():
                 for (img, template, _, _, _) in val_loader:
                     img, template = img.unsqueeze(1).cuda(), template.unsqueeze(1).cuda()
@@ -119,9 +132,9 @@ def train_model(image_paths, template_path, out_ch, out_lay, image_sigma, prior_
                     # get deformation field
                     tot_mean, tot_std, means, stds = model(stacked_input)
 
-                    deformed_cur_img = apply_deformation_using_disp(img, tot_mean[-1]) # using mean as deformation field
+                    deformed_cur_img = apply_deformation_using_disp(img, tot_mean[-1]) # using mean as deformation field (no sampling)
 
-                    loss, similar, smooth = criterion(deformed_cur_img, template, tot_mean[-1], tot_std[-1])
+                    loss, similar, smooth, buff = criterion(deformed_cur_img, template, means, stds, return_all=True)
                     sim_loss = MSE_loss(deformed_cur_img, template)
             
                     total_loss += loss.item()
@@ -131,6 +144,7 @@ def train_model(image_paths, template_path, out_ch, out_lay, image_sigma, prior_
 
                     for i in range(out_lay):
                         uncertainties[i] += stds[i].mean()
+                        smooths[i] += buff[i]
 
                 # === wandb Logging (Validation) ===
                 wandb.log({
@@ -143,6 +157,7 @@ def train_model(image_paths, template_path, out_ch, out_lay, image_sigma, prior_
                 for i in range(out_lay):
                     wandb.log({
                         f"Val_Uncert/layer_{out_lay-i}": uncertainties[i] / len(val_loader),
+                        f"Val_Smooth/layer_{out_lay-i}": smooths[i] / len(val_loader),
                         "Epoch": epoch
                     })
 
@@ -164,7 +179,7 @@ def train_model(image_paths, template_path, out_ch, out_lay, image_sigma, prior_
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--image_path", type=str, default="data/brain_core_zero")
-    parser.add_argument("--template_path", type=str, default="MNI_template/MNI_skremove_RAS_cropped.nii")
+    parser.add_argument("--template_path", type=str, default="MNI_skremove_RAS_cropped.nii")
     parser.add_argument("--start_epoch", type=int, default=0)
     parser.add_argument("--saved_path", default=None)
 

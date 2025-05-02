@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from torchinfo import summary
+# from torchinfo import summary
 import torch.nn.functional as F
 import numpy as np
     
@@ -106,7 +106,7 @@ class U_Net_Hyprid(nn.Module):
             means, stds = means[-self.out_layers:], stds[-self.out_layers:]
 
             tot_means = self.combine_residuals(means)
-            tot_stds = self.combine_residuals(stds)
+            tot_stds = self.combine_residuals_std(stds)
             
             return tot_means, tot_stds, means, stds
         
@@ -140,6 +140,13 @@ class U_Net_Hyprid(nn.Module):
             prev = F.interpolate(tot_flows[-1], size=f.shape[2:], mode='trilinear')
             tot_flows.append(prev + f)
         return tot_flows
+    
+    def combine_residuals_std(self, stds):
+        tot_vars = [stds[0]]  # σ₁²
+        for s in stds[1:]:
+            prev = F.interpolate(tot_vars[-1], size=s.shape[2:], mode='trilinear', align_corners=True)
+            tot_vars.append(torch.sqrt(prev ** 2 + s ** 2))
+        return tot_vars
     
 class Correction(nn.Module):
     def __init__(self, out_layers):

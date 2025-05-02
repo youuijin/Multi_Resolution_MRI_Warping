@@ -281,12 +281,11 @@ class Miccai2018Loss(torch.nn.Module):
     KL divergence loss + image reconstruction loss
     """
 
-    def __init__(self, reg, image_sigma=0.02, prior_lambda=10.0, vol_shape=None):
+    def __init__(self, reg, image_sigma=0.02, prior_lambda=10.0):
         super().__init__()
         self.image_sigma = image_sigma
         self.prior_lambda = prior_lambda
-        self.vol_shape = vol_shape  # [D, H, W]
-        self.register_buffer('degree_matrix', None)
+        self.degree_matrices = dict()
 
         if reg == 'tv':
             self.reg_fn = tv_loss_l2
@@ -308,37 +307,22 @@ class Miccai2018Loss(torch.nn.Module):
             filt[i, 0] = filt_inner
         return filt 
 
-    def _compute_degree_matrix(self, device):
-        """
-        Convolve ones with adjacency filter to compute degree matrix.
-        """
-        filt = self._adj_filt_3d().to(device)  # [3,1,3,3,3]
-        z = torch.ones(1, 3, *self.vol_shape, device=device)
-        D = F.conv3d(z, filt, padding=1, stride=1, groups=3)
-
-        return D
-
-    def _precision_loss(self, mu):
-        """
-        Encourage smooth deformation field.
-        mu: Tensor of shape [B, 3, D, H, W]
-        """
-        diffs = 0
-        for i in range(3):
-            shift = torch.roll(mu[:, i], shifts=-1, dims=2 + i)
-            diffs += torch.mean((mu[:, i] - shift) ** 2)
-        return 0.5 * diffs / 3.0
+    def _compute_degree_matrix(self, device, vol_shape):
+        key = tuple(vol_shape)
+        if key not in self.degree_matrices:
+            filt = self._adj_filt_3d().to(device)
+            z = torch.ones(1, 3, *vol_shape, device=device)
+            D = F.conv3d(z, filt, padding=1, stride=1, groups=3)
+            self.degree_matrices[key] = D
+        return self.degree_matrices[key]
 
     def kl_loss(self, mean, std):
         """
         y_pred: [B, 6, D, H, W] -> 3 channels mean, 3 channels log(sigma)
         """
+        self.degree_matrix = self._compute_degree_matrix(mean.device, mean.shape[2:])
 
-        if self.degree_matrix is None:
-            assert self.vol_shape is not None, "vol_shape must be provided."
-            self.degree_matrix = self._compute_degree_matrix(mean.device)
-
-        sigma_term = self.prior_lambda * self.degree_matrix * (std**2) - torch.log(std)
+        sigma_term = self.prior_lambda * self.degree_matrix * (std**2) - torch.log(std**2)
         sigma_term = torch.mean(sigma_term)
 
         # prec_term = self.prior_lambda * self._precision_loss(mu)
@@ -352,12 +336,20 @@ class Miccai2018Loss(torch.nn.Module):
         """
         return 1. / (2* self.image_sigma ** 2) * torch.mean((y_true - y_pred) ** 2)
 
-    def forward(self, y_pred_image, y_true, mean, std):
+    def forward(self, warped, fixed, means, stds, return_all=False):
         """
         y_true: ground truth image [B, 1, D, H, W]
         y_pred_image: warped image [B, 1, D, H, W]
-        y_pred_flow: flow field prediction [B, 6, D, H, W]
+        means, stds: not accumulated, just output (residual)
         """
-        r = self.recon_loss(y_true, y_pred_image)
-        kl =  self.kl_loss(mean, std)
-        return r + kl, r.item(), kl.item()
+        recon_loss = self.recon_loss(fixed, warped)
+        kl_loss_total = torch.tensor(0.0, device=warped.device)
+        buff = []
+        for mean, std in zip(means, stds):
+            kl = self.kl_loss(mean, std)
+            kl_loss_total += kl
+            if return_all:
+                buff.append(kl.item())
+        if return_all:
+            return recon_loss + kl_loss_total, recon_loss.item(), kl_loss_total.item(), buff
+        return recon_loss + kl_loss_total, recon_loss.item(), kl_loss_total.item()
