@@ -10,10 +10,6 @@ from utils.dataset import set_dataloader
 
 wandb.login(key="87539aeaa75ad2d8a28ec87d70e5d6ce1277c544")
 
-import matplotlib.pyplot as plt
-import wandb
-import torch
-
 def transform_slice(img):
     # apply 90-degree CCW rotation + horizontal flip
     return np.fliplr(np.rot90(img, k=1))
@@ -207,13 +203,13 @@ def train_model(image_paths, template_path, out_ch, out_lay, image_sigma, prior_
                     cnt = 0
                     best_loss = total_loss / len(val_loader)
                     torch.save(model.state_dict(), f'./{log_name}_total.pt')
-                    # wandb.save( f'./{log_name}_total.pt')
+                    wandb.save( f'./{log_name}_total.pt')
         
                 if best_mse_loss > total_MSE_loss / len(val_loader):
                     cnt = 0
                     best_loss = total_loss / len(val_loader)
                     torch.save(model.state_dict(), f'./{log_name}_mse.pt')
-                    # wandb.save( f'./{log_name}_mse.pt')
+                    wandb.save( f'./{log_name}_mse.pt')
                 else: 
                     cnt+=1
 

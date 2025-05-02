@@ -12,10 +12,18 @@ def set_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
+def normalize_deformation(displace_field):
+    D, H, W = displace_field.shape[2:]
+    norm_disp = torch.zeros_like(displace_field)
+    norm_disp[:, 0] = displace_field[:, 0] / (W / 2)
+    norm_disp[:, 1] = displace_field[:, 1] / (H / 2)
+    norm_disp[:, 2] = displace_field[:, 2] / (D / 2)
+    return norm_disp
+
 def apply_deformation_using_disp(img, displace_field):
     """
     img: torch.Tensor of shape (1, 1, D, H, W) - single channel 3D image
-    displace_field: torch.Tensor of shape (1, D, H, W, 3) - displace field (dx, dy, dz)
+    displace_field: torch.Tensor of shape (1, 3, D, H, W) - displace field (dx, dy, dz)
     x : W, y : H, z : D
     """
     B, _, D, H, W = img.shape
@@ -29,7 +37,8 @@ def apply_deformation_using_disp(img, displace_field):
     grid = grid.unsqueeze(0).repeat(B, 1, 1, 1, 1).to(img.device)
 
     # Apply deformation
-    deformed_grid = grid + displace_field
+    normalized_disp = normalize_deformation(displace_field)
+    deformed_grid = grid + normalized_disp
 
     # Reshape grid to match F.grid_sample requirements
     deformed_grid = deformed_grid.permute(0, 2, 3, 4, 1)
