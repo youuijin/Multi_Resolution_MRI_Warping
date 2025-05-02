@@ -82,26 +82,26 @@ class U_Net_Hyprid(nn.Module):
         # decoding
         if self.out_channels == 6:
             means = [] # only residual
-            stds = []
+            stds = [] # model output = log \sigma^2 -> exp(0.5*log \sigma^2)
             x5 = self.dec1(x4)
             concated = self.flows[0](x5)
             means.append(concated[:, :3])
-            stds.append(torch.exp(2 * concated[:, 3:])) # output = log variance
+            stds.append(torch.exp(0.5 * concated[:, 3:])) # output = log variance
             up_x5 = self.upsample1(x5)
             x6 = self.dec2(torch.cat([x3, up_x5], dim=1))
             concated = self.flows[1](x6)
             means.append(concated[:, :3])
-            stds.append(torch.exp(2 * concated[:, 3:]))
+            stds.append(torch.exp(0.5 * concated[:, 3:]))
             up_x6 = self.upsample2(x6)
             x7 = self.dec3(torch.cat([x2, up_x6], dim=1))
             concated = self.flows[2](x7)
             means.append(concated[:, :3])
-            stds.append(torch.exp(2 * concated[:, 3:]))
+            stds.append(torch.exp(0.5 * concated[:, 3:]))
             up_x7 = self.upsample3(x7)
             x8 = self.dec4(torch.cat([x1, up_x7], dim=1))
             concated = self.flows[3](x8)
             means.append(concated[:, :3])
-            stds.append(torch.exp(2 * concated[:, 3:]))
+            stds.append(torch.exp(0.5 * concated[:, 3:]))
 
             means, stds = means[-self.out_layers:], stds[-self.out_layers:]
 

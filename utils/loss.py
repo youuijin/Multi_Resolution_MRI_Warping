@@ -217,31 +217,33 @@ class TrainLoss(torch.nn.Module):
             return buff
         return tot_loss, sim_loss.item(), reg_loss.item()
 
-def negative_log_likelihood(moved, fixed, std): # 사실 두 loss를 더한 형태가 맞지만, logging을 위해 분리하여 사용
-    # nll = ((fixed - moved) ** 2) / (2 * std ** 2 + 1e-5) + 0.5 * torch.log(std ** 2 + 1e-5)
-    nll = ((fixed - moved) ** 2) / (2 * std ** 2 + 1e-5)
-    return nll.mean()
-
-def nll_reg(std):
-    return (0.5 * torch.log(std ** 2 + 1e-5)).mean()
-
-def KL_div_loss(mean, std):
-    kl = 0.5 * (mean**2 + std**2 - torch.log(std**2 + 1e-6) -1)
-    return kl.mean()
-
 ## regularization - Total Variation
-def adaptive_tv_loss(phi, std, eps=1e-6):
+def tv_loss_l2(displace, std=None):
     """
     displace: Tensor of shape [B, 3, D, H, W]
     TV loss는 인접 voxel 간의 L1 차이의 평균을 구하는 방식입니다.
     """
     # Depth 방향 차이 (D axis)
-    dz = torch.abs(phi[:, :, 1:, :, :] - phi[:, :, :-1, :, :])
+    dz = torch.mean((displace[:, :, 1:, :, :] - displace[:, :, :-1, :, :])**2)
     # Height 방향 차이 (H axis)
-    dy = torch.abs(phi[:, :, :, 1:, :] - phi[:, :, :, :-1, :])
+    dy = torch.mean((displace[:, :, :, 1:, :] - displace[:, :, :, :-1, :])**2)
     # Width 방향 차이 (W axis)
-    dx = torch.abs(phi[:, :, :, :, 1:] - phi[:, :, :, :, :-1])
-    
+    dx = torch.mean((displace[:, :, :, :, 1:] - displace[:, :, :, :, :-1])**2)
+
+    loss = (dx + dy + dz)/3.
+    return loss.mean()
+
+## regularization - Total Variation
+def adaptive_tv_loss_l2(phi, std, eps=1e-6):
+    """
+    Adaptive total variation loss based on inverse σ².
+    phi: [B, 3, D, H, W]
+    std: [B, 3, D, H, W]  (std = exp(0.5 * log_sigma))
+    """
+    dz = (phi[:, :, 1:, :, :] - phi[:, :, :-1, :, :])**2
+    dy = (phi[:, :, :, 1:, :] - phi[:, :, :, :-1, :])**2
+    dx = (phi[:, :, :, :, 1:] - phi[:, :, :, :, :-1])**2
+
     sigma_z = std[:, :, 1:, :, :]
     sigma_y = std[:, :, :, 1:, :]
     sigma_x = std[:, :, :, :, 1:]
@@ -249,63 +251,113 @@ def adaptive_tv_loss(phi, std, eps=1e-6):
     weight_z = 1.0 / (sigma_z**2 + eps)
     weight_y = 1.0 / (sigma_y**2 + eps)
     weight_x = 1.0 / (sigma_x**2 + eps)
+
+    loss_z = (weight_z * dz).mean()
+    loss_y = (weight_y * dy).mean()
+    loss_x = (weight_x * dx).mean()
+
+    return (loss_z + loss_y + loss_x) / 3.0
+
+def precompute_degree_matrix_3d(vol_shape=(192, 224, 192)):
+    H, W, D = vol_shape
+    deg = 6 * torch.ones(H, W, D)  # 6-방향 이웃 기준
     
-    loss_z = (weight_z * dz.abs()).mean()
-    loss_y = (weight_y * dy.abs()).mean()
-    loss_x = (weight_x * dx.abs()).mean()
+    # 경계 복셀 처리
+    deg[0,:,:] -= 1    # x=0 경계
+    deg[-1,:,:] -= 1   # x=H-1
+    deg[:,0,:] -= 1    # y=0
+    deg[:,-1,:] -= 1   # y=W-1
+    deg[:,:,0] -= 1    # z=0
+    deg[:,:,-1] -= 1   # z=D-1
+
+    # fro_norm = torch.norm(deg)
+    # scaled_deg = deg / fro_norm
     
-    loss = (loss_z + loss_y + loss_x)/3
-    return loss
+    return deg.flatten()  # [H*W*D]
 
-class UncertaintyLoss(torch.nn.Module):
-    def __init__(self, sim='NLL', reg=None, alpha=None, alp_sca=1.0, sca_fn='exp'):
-        super(UncertaintyLoss, self).__init__()
-        self.alpha = alpha  # Adjust balance between NCC and NL2 normCC
-        self.sim = sim
-        if sim == "NLL":
-            self.sim_loss = negative_log_likelihood
-        elif sim == "NCC":
-            self.sim_loss = NCC_loss
-        
-        if reg is None:
-            self.reg_loss, self.reg_alpha = [], [] # default regularizer
-        else:
-            assert len(reg.split("_")) == len(alpha.split("_"))
-            self.reg_loss, self.reg_alpha = [], [float(a) for a in alpha.split("_")]
-            for r in reg.split('_'):
-                if r == 'KL':
-                    loss_fn = KL_div_loss
-                elif r == "atv":
-                    loss_fn = adaptive_tv_loss
-                elif r == "tv":
-                    loss_fn = tv_loss
-                self.reg_loss += [loss_fn]
-    
-        self.alp_sca = alp_sca
-        self.sca_fn = sca_fn
+class Miccai2018Loss(torch.nn.Module):
+    """
+    MICCAI 2018 VoxelMorph Loss for 3D:
+    KL divergence loss + image reconstruction loss
+    """
 
-    def forward(self, deformed_img, template_img, disp_mean, disp_std, res_mean, res_std, idx=0, return_all=False):
-        out_layers = len(disp_mean)
-        weights = [1/2**(out_layers - i-1) for i in range(out_layers)] # 1/4, 1/2, 1
-        
-        if self.sim == 'NLL':
-            sim_loss = self.sim_loss(deformed_img, template_img, disp_std[-1]) # only in last layer
-            reg_std_loss = nll_reg(disp_std[-1]) # only in last layer
-        elif self.sim == "NCC":
-            sim_loss = self.sim_loss(deformed_img, template_img)
-            reg_std_loss = torch.tensor(0.0, device=deformed_img.device)
+    def __init__(self, reg, image_sigma=0.02, prior_lambda=10.0, vol_shape=None):
+        super().__init__()
+        self.image_sigma = image_sigma
+        self.prior_lambda = prior_lambda
+        self.vol_shape = vol_shape  # [D, H, W]
+        self.register_buffer('degree_matrix', None)
 
-        buff = []
-        reg_loss = torch.tensor(0.0, device=deformed_img.device)
-        for loss_fn, alpha in zip(self.reg_loss, self.reg_alpha):
-            # every resolution using weight
-            for w, mean, std in zip(weights, res_mean, res_std):
-                this_loss = loss_fn(mean, std)
-                reg_loss += w * alpha *this_loss
-                if return_all:
-                    buff.append(this_loss.item())
+        if reg == 'tv':
+            self.reg_fn = tv_loss_l2
+        elif reg == 'atv':
+            self.reg_fn = adaptive_tv_loss_l2
 
-        tot_loss = sim_loss + reg_std_loss + reg_loss
-        if return_all:
-            return tot_loss, sim_loss.item(), reg_std_loss.item(), reg_loss.item(), buff
-        return tot_loss, sim_loss.item(), reg_std_loss.item(), reg_loss.item()
+    def _adj_filt_3d(self):
+        """
+        Build 3D adjacency filter for computing degree matrix.
+        Output: Tensor of shape [3, 1, 3, 3, 3] for grouped conv
+        """
+        filt_inner = torch.zeros(3, 3, 3)
+        filt_inner[1, 1, [0, 2]] = 1  # x neighbors
+        filt_inner[1, [0, 2], 1] = 1  # y neighbors
+        filt_inner[[0, 2], 1, 1] = 1  # z neighbors
+
+        filt = torch.zeros(3, 1, 3, 3, 3)
+        for i in range(3):
+            filt[i, 0] = filt_inner
+        return filt 
+
+    def _compute_degree_matrix(self, device):
+        """
+        Convolve ones with adjacency filter to compute degree matrix.
+        """
+        filt = self._adj_filt_3d().to(device)  # [3,1,3,3,3]
+        z = torch.ones(1, 3, *self.vol_shape, device=device)
+        D = F.conv3d(z, filt, padding=1, stride=1, groups=3)
+
+        return D
+
+    def _precision_loss(self, mu):
+        """
+        Encourage smooth deformation field.
+        mu: Tensor of shape [B, 3, D, H, W]
+        """
+        diffs = 0
+        for i in range(3):
+            shift = torch.roll(mu[:, i], shifts=-1, dims=2 + i)
+            diffs += torch.mean((mu[:, i] - shift) ** 2)
+        return 0.5 * diffs / 3.0
+
+    def kl_loss(self, mean, std):
+        """
+        y_pred: [B, 6, D, H, W] -> 3 channels mean, 3 channels log(sigma)
+        """
+
+        if self.degree_matrix is None:
+            assert self.vol_shape is not None, "vol_shape must be provided."
+            self.degree_matrix = self._compute_degree_matrix(mean.device)
+
+        sigma_term = self.prior_lambda * self.degree_matrix * (std**2) - torch.log(std)
+        sigma_term = torch.mean(sigma_term)
+
+        # prec_term = self.prior_lambda * self._precision_loss(mu)
+        prec_term = self.prior_lambda * 0.5 * self.reg_fn(mean)
+
+        return 0.5 * 3 * (sigma_term + prec_term)
+
+    def recon_loss(self, y_true, y_pred):
+        """
+        MSE reconstruction loss.
+        """
+        return 1. / (2* self.image_sigma ** 2) * torch.mean((y_true - y_pred) ** 2)
+
+    def forward(self, y_pred_image, y_true, mean, std):
+        """
+        y_true: ground truth image [B, 1, D, H, W]
+        y_pred_image: warped image [B, 1, D, H, W]
+        y_pred_flow: flow field prediction [B, 6, D, H, W]
+        """
+        r = self.recon_loss(y_true, y_pred_image)
+        kl =  self.kl_loss(mean, std)
+        return r + kl, r.item(), kl.item()
