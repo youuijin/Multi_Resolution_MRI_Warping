@@ -1,5 +1,6 @@
 import torch, wandb, argparse
 import torch.optim as optim
+import matplotlib.pyplot as plt
 from tqdm import tqdm
 from utils.R2Net_model import U_Net_Hyprid
 
@@ -8,6 +9,47 @@ from utils.loss import MSE_loss, Miccai2018Loss
 from utils.dataset import set_dataloader
 
 wandb.login(key="87539aeaa75ad2d8a28ec87d70e5d6ce1277c544")
+
+import matplotlib.pyplot as plt
+import wandb
+import torch
+
+def transform_slice(img):
+    # apply 90-degree CCW rotation + horizontal flip
+    return np.fliplr(np.rot90(img, k=1))
+
+
+def save_middle_slices(img_3d, epoch, idx):
+    """
+    img_3d: [D, H, W] or [1, D, H, W] or [B, 1, D, H, W] (e.g., torch.Tensor)
+    Returns: matplotlib Figure with x, y, z middle slices side-by-side
+    """
+    if isinstance(img_3d, torch.Tensor):
+        img_3d = img_3d.squeeze().detach().cpu().numpy()
+
+    D, H, W = img_3d.shape
+
+    slice_x = transform_slice(img_3d[D // 2, :, :])
+    slice_y = transform_slice(img_3d[:, H // 2, :])
+    slice_z = transform_slice(img_3d[:, :, W // 2])
+
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+    axes[0].imshow(slice_z, cmap='gray')
+    axes[0].set_title('Axial (X)')
+    axes[1].imshow(slice_y, cmap='gray')
+    axes[1].set_title('Coronal (Y)')
+    axes[2].imshow(slice_x, cmap='gray')
+    axes[2].set_title('Sagittal (Z)')
+
+    for ax in axes:
+        ax.axis('off')
+
+
+    plt.tight_layout()
+    wandb.log({f"Media/deformed_slices_img{idx}": wandb.Image(fig)}, step=epoch)
+    
+    plt.close(fig)
+    return fig
 
 # Training setup
 def train_model(image_paths, template_path, out_ch, out_lay, image_sigma, prior_lambda, loss='ELBO', reg='TV', epochs=200, batch_size=1, lr=1e-4, alpha=0.5, val_interval=5, start_epoch=0, saved_path=None):
@@ -108,15 +150,13 @@ def train_model(image_paths, template_path, out_ch, out_lay, image_sigma, prior_
         wandb.log({
             "Train/Total_Loss": total_loss / len(train_loader),
             "Train/Similar_Loss": total_similar / len(train_loader),
-            "Train/Smooth_Loss": total_smooth / len(train_loader),
-            "Epoch": epoch
-        })
+            "Train/Smooth_Loss": total_smooth / len(train_loader)
+        }, step=epoch)
         for i in range(out_lay):
             wandb.log({
                 f"Train_Uncert/layer_{out_lay-i}": uncertainties[i] / len(train_loader),
-                f"Train_Smooth/layer_{out_lay-i}": smooths[i] / len(train_loader),
-                "Epoch": epoch
-            })
+                f"Train_Smooth/layer_{out_lay-i}": smooths[i] / len(train_loader)
+            }, step=epoch)
 
         if epoch%val_interval == 0:
             model.eval()
@@ -125,7 +165,7 @@ def train_model(image_paths, template_path, out_ch, out_lay, image_sigma, prior_
             total_similar, total_smooth = 0, 0
             uncertainties, smooths = [0. for _ in range(out_lay)], [0. for _ in range(out_lay)]
             with torch.no_grad():
-                for (img, template, _, _, _) in val_loader:
+                for idx, (img, template, _, _, _) in enumerate(val_loader):
                     img, template = img.unsqueeze(1).cuda(), template.unsqueeze(1).cuda()
                     stacked_input = torch.cat([img, template], dim=1)
 
@@ -146,33 +186,34 @@ def train_model(image_paths, template_path, out_ch, out_lay, image_sigma, prior_
                         uncertainties[i] += stds[i].mean()
                         smooths[i] += buff[i]
 
+                    if idx < 2:
+                        save_middle_slices(deformed_cur_img, epoch, idx)
+
                 # === wandb Logging (Validation) ===
                 wandb.log({
                     "Val/Total_Loss": total_loss / len(val_loader),
                     "Val/MSE_Loss": total_MSE_loss / len(val_loader),
                     "Val/Similar_Loss": total_similar / len(val_loader),
                     "Val/Smooth_Loss": total_smooth / len(val_loader),
-                    "Epoch": epoch
-                })
+                }, step=epoch)
                 for i in range(out_lay):
                     wandb.log({
                         f"Val_Uncert/layer_{out_lay-i}": uncertainties[i] / len(val_loader),
                         f"Val_Smooth/layer_{out_lay-i}": smooths[i] / len(val_loader),
-                        "Epoch": epoch
-                    })
+                    }, step=epoch)
 
                 print(f"Epoch {epoch}/{epochs}, Valid Loss: {total_loss / len(val_loader)}")
                 if best_loss > total_loss / len(val_loader):
                     cnt = 0
                     best_loss = total_loss / len(val_loader)
                     torch.save(model.state_dict(), f'./{log_name}_total.pt')
-                    wandb.save( f'./{log_name}_total.pt')
+                    # wandb.save( f'./{log_name}_total.pt')
         
                 if best_mse_loss > total_MSE_loss / len(val_loader):
                     cnt = 0
                     best_loss = total_loss / len(val_loader)
                     torch.save(model.state_dict(), f'./{log_name}_mse.pt')
-                    wandb.save( f'./{log_name}_mse.pt')
+                    # wandb.save( f'./{log_name}_mse.pt')
                 else: 
                     cnt+=1
 
